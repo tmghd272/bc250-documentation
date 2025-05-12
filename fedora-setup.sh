@@ -6,45 +6,58 @@ if [[ $(id -u) != "0" ]]; then
     exit 1
 fi
 
-# install patched mesa + block any updates from main repos
-echo -n "Adding mesa copr... "
-if grep -q Nobara "/etc/system-release"; then
-    echo -n "Nobara detected... "
-    sed -i '2s/^/exclude=mesa*\n/' /etc/yum.repos.d/nobara.repo 
-else 
-    echo -n "Fedora my beloved... "
-    sed -i '2s/^/exclude=mesa*\n/' /etc/yum.repos.d/fedora.repo
-    sed -i '2s/^/exclude=mesa*\n/' /etc/yum.repos.d/fedora-updates.repo
+# === 1. Setup mesa COPR ===
+echo -n "Adding mesa COPR repo (exotic-soc)... "
+rpm-ostree override remove mesa* --install --idempotent \
+    https://copr.fedorainfracloud.org/coprs/g/exotic-soc/bc250-mesa/repo/fedora-$(rpm -E %fedora)/g-exotic-soc-bc250-mesa-fedora-$(rpm -E %fedora).repo
+
+# Tell the user they MUST reboot
+echo "Mesa override added. Please reboot to apply Mesa changes."
+
+# === 2. Set RADV_DEBUG globally ===
+echo -n "Setting RADV_DEBUG=nocompute system-wide... "
+if ! grep -q "RADV_DEBUG=nocompute" /etc/environment; then
+    echo "RADV_DEBUG=nocompute" >> /etc/environment
 fi
-dnf copr enable @exotic-soc/bc250-mesa -y
-dnf upgrade -y 
 
-# make sure radv_debug option is set in environment
-echo -n "Setting RADV_DEBUG option... "
-echo 'RADV_DEBUG=nocompute' > /etc/environment
+# === 3. Install build tools and governor ===
+echo "Installing packages for GPU governor build..."
+rpm-ostree install libdrm-devel cmake make gcc-c++ git
 
-# install segfaults governor
-echo "Installing GPU governor... "
-dnf install libdrm-devel cmake make g++ git -y
-git clone https://github.com/alexghow903/oberon-governor-atomic.git && cd oberon-governor
-cmake . && make && make install
-systemctl enable oberon-governor.service
+echo "You must reboot before continuing to complete package layering!"
+read -p "Reboot now? [y/N] " answer
+if [[ "$answer" =~ ^[Yy]$ ]]; then
+    systemctl reboot
+    exit 0
+else
+    echo "Please reboot and rerun this script to finish building the governor."
+    exit 0
+fi
 
-# make sure amdgpu and nct6683 options are in the modprobe files and update initrd
-echo -n "Setting amdgpu module option... "
-echo 'options amdgpu sg_display=0' > /etc/modprobe.d/options-amdgpu.conf
-echo -n "Setting nct6683 module option... "
-echo 'nct6683' > /etc/modules-load.d/99-sensors.conf
-echo 'options nct6683 force=true' > /etc/modprobe.d/options-sensors.conf
-echo "OK, regenerating initrd (this may take a while)"
-dracut --stdlog=4 --regenerate-all --force
+# === AFTER reboot, re-run this part manually ===
+# git clone https://gitlab.com/mothenjoyer69/oberon-governor.git
+# cd oberon-governor
+# cmake .
+# make
+# sudo make install
+# sudo cp ./oberon-governor.service /etc/systemd/system/
+# sudo systemctl daemon-reexec
+# sudo systemctl enable --now oberon-governor.service
 
-# clear nomodeset from /etc/default/grub and update config
-echo "Fixing up GRUB config..."
+# === 4. Modprobe settings ===
+# These steps can be run now or after reboot
+
+echo "options amdgpu sg_display=0" | tee /etc/modprobe.d/options-amdgpu.conf
+echo 'nct6683' | tee /etc/modules-load.d/99-sensors.conf
+echo 'options nct6683 force=true' | tee /etc/modprobe.d/options-sensors.conf
+
+echo "Regenerating initrd..."
+dracut --regenerate-all --force
+
+# === 5. GRUB cleanup ===
+echo "Cleaning GRUB from 'nomodeset' and 'amdgpu.sg_display=0'..."
 sed -i 's/nomodeset//g' /etc/default/grub
 sed -i 's/amdgpu\.sg_display=0//g' /etc/default/grub
 grub2-mkconfig -o /etc/grub2.cfg
 
-# that should do it
-echo "Done! Rebooting system in 15 seconds, ctrl-C now to cancel..."
-sleep 15 && systemctl reboot
+echo "Setup done. You should reboot now."
